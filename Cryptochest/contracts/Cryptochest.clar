@@ -1,8 +1,15 @@
-;; Cryptochest: Decentralized Personal Data Vault on Stacks
+;; Cryptochest Smart Contract
+;; Decentralized Personal Data Vault on Stacks
 
 ;; Administrative Variables
 (define-data-var system-owner principal tx-sender)
 (define-data-var current-chain-height uint u0)
+
+;; Constants for validation
+(define-constant MAX_BLOCK_HEIGHT u1000000000)
+(define-constant MIN_ACCESS_FEE u1)
+(define-constant MAX_ACCESS_FEE u1000000)
+(define-constant MAX_STRING_LENGTH u256)
 
 ;; Data Structures
 (define-map personal-storage-registry
@@ -39,11 +46,39 @@
 (define-constant ERR_STORAGE_EXISTS (err u409))
 (define-constant ERR_STORAGE_MISSING (err u404))
 (define-constant ERR_PRICE_INVALID (err u400))
+(define-constant ERR_INVALID_INPUT (err u422))
+(define-constant ERR_RECORD_NOT_FOUND (err u403))
+
+;; Input validation functions
+(define-private (is-valid-block-height (height uint))
+    (and (> height u0) (<= height MAX_BLOCK_HEIGHT))
+)
+
+(define-private (is-valid-access-fee (fee uint))
+    (and (>= fee MIN_ACCESS_FEE) (<= fee MAX_ACCESS_FEE))
+)
+
+(define-private (is-valid-string (str (string-utf8 256)))
+    (and (> (len str) u0) (<= (len str) MAX_STRING_LENGTH))
+)
+
+(define-private (is-valid-hash (hash (string-utf8 64)))
+    (is-eq (len hash) u64)
+)
+
+(define-private (is-valid-category (category (string-utf8 32)))
+    (and (> (len category) u0) (<= (len category) u32))
+)
+
+(define-private (is-valid-reason (reason (string-utf8 64)))
+    (and (> (len reason) u0) (<= (len reason) u64))
+)
 
 ;; Update current chain height (admin only)
 (define-public (update-chain-height (new-height uint))
     (begin
         (asserts! (is-eq tx-sender (var-get system-owner)) ERR_ACCESS_DENIED)
+        (asserts! (is-valid-block-height new-height) ERR_INVALID_INPUT)
         (ok (var-set current-chain-height new-height))
     )
 )
@@ -53,7 +88,7 @@
     (let
         ((caller tx-sender))
         (asserts! (is-none (get-storage-info caller)) ERR_STORAGE_EXISTS)
-        (asserts! (> entry-fee u0) ERR_PRICE_INVALID)
+        (asserts! (is-valid-access-fee entry-fee) ERR_PRICE_INVALID)
         (ok (map-set personal-storage-registry
             caller
             {
@@ -75,6 +110,12 @@
         ((caller tx-sender)
          (storage-details (unwrap! (get-storage-info caller) ERR_STORAGE_MISSING))
          (new-index (+ (get total-entries storage-details) u1)))
+        
+        ;; Validate all input parameters
+        (asserts! (is-valid-hash data-hash) ERR_INVALID_INPUT)
+        (asserts! (is-valid-string cipher-data) ERR_INVALID_INPUT)
+        (asserts! (is-valid-category type-label) ERR_INVALID_INPUT)
+        (asserts! (is-valid-hash verification-hash) ERR_INVALID_INPUT)
         
         (map-set encrypted-data-repository
             { owner-address: caller, record-index: new-index }
@@ -106,18 +147,29 @@
          (storage-info (unwrap! (get-storage-info data-holder) ERR_STORAGE_MISSING))
          (cost (get access-price storage-info)))
         
-        ;; Log access attempt
-        (map-set interaction-history
-            { data-holder: data-holder, accessor: requester, record-index: record-index }
-            {
-                timestamp: (var-get current-chain-height),
-                request-reason: access-purpose,
-                payment-amount: cost
-            }
-        )
+        ;; Validate inputs
+        (asserts! (> record-index u0) ERR_INVALID_INPUT)
+        (asserts! (<= record-index (get total-entries storage-info)) ERR_RECORD_NOT_FOUND)
+        (asserts! (is-valid-reason access-purpose) ERR_INVALID_INPUT)
+        (asserts! (not (is-eq requester data-holder)) ERR_INVALID_INPUT)
         
-        ;; Process payment
-        (stx-transfer? cost requester data-holder)
+        ;; Verify the record exists and is accessible
+        (let ((data-record (unwrap! (get-encrypted-record data-holder record-index) ERR_RECORD_NOT_FOUND)))
+            (asserts! (get is-accessible data-record) ERR_ACCESS_DENIED)
+            
+            ;; Log access attempt
+            (map-set interaction-history
+                { data-holder: data-holder, accessor: requester, record-index: record-index }
+                {
+                    timestamp: (var-get current-chain-height),
+                    request-reason: access-purpose,
+                    payment-amount: cost
+                }
+            )
+            
+            ;; Process payment
+            (stx-transfer? cost requester data-holder)
+        )
     )
 )
 
@@ -146,7 +198,7 @@
     (let
         ((caller tx-sender)
          (storage-info (unwrap! (get-storage-info caller) ERR_STORAGE_MISSING)))
-        (asserts! (> new-fee u0) ERR_PRICE_INVALID)
+        (asserts! (is-valid-access-fee new-fee) ERR_PRICE_INVALID)
         (ok (map-set personal-storage-registry
             caller
             (merge storage-info { access-price: new-fee })
@@ -158,10 +210,17 @@
 (define-public (toggle-data-visibility (record-index uint))
     (let
         ((caller tx-sender)
-         (data-record (unwrap! (get-encrypted-record caller record-index) ERR_ACCESS_DENIED)))
-        (ok (map-set encrypted-data-repository
-            { owner-address: caller, record-index: record-index }
-            (merge data-record { is-accessible: (not (get is-accessible data-record)) })
-        ))
+         (storage-info (unwrap! (get-storage-info caller) ERR_STORAGE_MISSING)))
+        
+        ;; Validate record index
+        (asserts! (> record-index u0) ERR_INVALID_INPUT)
+        (asserts! (<= record-index (get total-entries storage-info)) ERR_RECORD_NOT_FOUND)
+        
+        (let ((data-record (unwrap! (get-encrypted-record caller record-index) ERR_RECORD_NOT_FOUND)))
+            (ok (map-set encrypted-data-repository
+                { owner-address: caller, record-index: record-index }
+                (merge data-record { is-accessible: (not (get is-accessible data-record)) })
+            ))
+        )
     )
 )
